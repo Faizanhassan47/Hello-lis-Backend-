@@ -7,7 +7,8 @@ import os
 import secrets
 import time
 from pathlib import Path
-import sqlite3
+import pyodbc
+import os
 from threading import RLock
 from uuid import uuid4
 
@@ -64,43 +65,62 @@ def _load_openslide():
 openslide, DeepZoomGenerator, OPENSLIDE_IMPORT_ERROR = _load_openslide()
 
 
+
 class DictCursor:
-    def __init__(self, cursor):
+    def __init__(self, cursor, lastrowid=None):
         self.cursor = cursor
+        self._lastrowid = lastrowid
     def execute(self, *args):
         self.cursor.execute(*args)
         return self
     def fetchone(self):
         row = self.cursor.fetchone()
         if not row: return None
-        return dict(row)
+        if hasattr(self.cursor, 'description') and self.cursor.description:
+            return dict(zip([column[0].lower() for column in self.cursor.description], row))
+        return dict(row) # fallback
     
     def __iter__(self):
         return iter(self.fetchall())
     def fetchall(self):
         rows = self.cursor.fetchall()
         if not rows: return []
+        if hasattr(self.cursor, 'description') and self.cursor.description:
+            cols = [column[0].lower() for column in self.cursor.description]
+            return [dict(zip(cols, row)) for row in rows]
         return [dict(row) for row in rows]
     @property
     def lastrowid(self):
-        return self.cursor.lastrowid
-
-DB = Path(__file__).resolve().parent / 'cases.db'
+        return self._lastrowid
 
 class DBWrapper:
     def __init__(self):
-        self.conn = sqlite3.connect(str(DB), check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA busy_timeout = 5000")
+        driver = os.getenv("DB_DRIVER", "ODBC Driver 17 for SQL Server")
+        server = os.getenv("DB_SERVER", "localhost")
+        dbname = os.getenv("DB_NAME", "Hello")
+        conn_str = f"DRIVER={{{driver}}};SERVER={server};DATABASE={dbname};Trusted_Connection=yes;"
+        self.conn = pyodbc.connect(conn_str, autocommit=False)
     def execute(self, *args):
         cursor = self.conn.cursor()
         cursor.execute(*args)
-        return DictCursor(cursor)
+        lastrowid = None
+        sql = args[0].strip().upper()
+        if sql.startswith("INSERT"):
+            try:
+                cursor.execute("SELECT @@IDENTITY")
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    lastrowid = int(row[0])
+            except:
+                pass
+        return DictCursor(cursor, lastrowid)
     def commit(self):
         self.conn.commit()
+    def rollback(self):
+        self.conn.rollback()
     def close(self):
         self.conn.close()
+
     def __enter__(self):
         return self
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -116,18 +136,20 @@ def init_db():
     """Create the slide model and idempotently lift legacy case files into it."""
     with closing(connect()) as db:
         db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                display_name TEXT NOT NULL,
-                role TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' and xtype='U')
+CREATE TABLE users (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                username VARCHAR(255) UNIQUE NOT NULL,
+                display_name VARCHAR(MAX) NOT NULL,
+                role VARCHAR(MAX) NOT NULL,
+                password_hash VARCHAR(MAX) NOT NULL,
                 is_active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                last_login TEXT
+                created_at VARCHAR(MAX) DEFAULT CURRENT_TIMESTAMP,
+                last_login DATETIME
             )
         """)
-        user_columns = {row['name'] for row in db.execute("PRAGMA table_info(users)")}
+        user_columns = {row['name'] for row in db.execute("SELECT COLUMN_NAME as name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='users'")}
         if 'password' in user_columns:
             db.execute("UPDATE users SET password = NULL")
             try:
@@ -136,14 +158,16 @@ def init_db():
                 pass
             
         db.execute("""
-            CREATE TABLE IF NOT EXISTS cases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            case_id TEXT NOT NULL UNIQUE,
-            description TEXT NOT NULL,
-            filename TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='cases' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='cases' and xtype='U')
+CREATE TABLE cases (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            case_id VARCHAR(255) NOT NULL UNIQUE,
+            description VARCHAR(MAX) NOT NULL,
+            filename VARCHAR(255) NOT NULL DEFAULT '',
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
-        case_columns = {row['name'] for row in db.execute("PRAGMA table_info(cases)")}
+        case_columns = {row['name'] for row in db.execute("SELECT COLUMN_NAME as name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='cases'")}
         for name, definition in {
             "file_type": "TEXT NOT NULL DEFAULT 'raster'",
             "format": "TEXT",
@@ -156,32 +180,34 @@ def init_db():
             if name not in case_columns:
                 db.execute(f"ALTER TABLE cases ADD {name} {definition}")
 
-        db.execute('''CREATE TABLE IF NOT EXISTS slides (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        db.execute('''IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='slides' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='slides' and xtype='U')
+CREATE TABLE slides (
+            id INT IDENTITY(1,1) PRIMARY KEY,
             case_id INT NOT NULL REFERENCES cases(id) ,
-            label TEXT NOT NULL,
-            stain TEXT NOT NULL DEFAULT '',
-            specimen_description TEXT NOT NULL DEFAULT '',
-            filename TEXT NOT NULL UNIQUE,
-            file_type TEXT NOT NULL CHECK (file_type IN ('raster', 'wsi')),
-            format TEXT NOT NULL,
+            label VARCHAR(MAX) NOT NULL,
+            stain VARCHAR(MAX) NOT NULL DEFAULT '',
+            specimen_description VARCHAR(MAX) NOT NULL DEFAULT '',
+            filename VARCHAR(255) NOT NULL UNIQUE,
+            file_type VARCHAR(MAX) NOT NULL CHECK (file_type IN ('raster', 'wsi')),
+            format VARCHAR(MAX) NOT NULL,
             file_size INT NOT NULL,
             width INT NOT NULL,
             height INT NOT NULL,
             level_count INT NOT NULL DEFAULT 1,
-            thumbnail BLOB,
-            upload_state TEXT NOT NULL DEFAULT 'uploading' CHECK (upload_state IN ('uploading', 'processing', 'ready', 'error')),
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            qc_status TEXT,
+            thumbnail VARBINARY(MAX),
+            upload_state VARCHAR(MAX) NOT NULL DEFAULT 'uploading' CHECK (upload_state IN ('uploading', 'processing', 'ready', 'error')),
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            qc_status VARCHAR(MAX),
             qc_missing_tissue INTEGER DEFAULT 0,
             qc_blur INTEGER DEFAULT 0,
             qc_scan_artifact INTEGER DEFAULT 0,
             qc_incorrect_label INTEGER DEFAULT 0,
-            qc_note TEXT DEFAULT '',
-            qc_actor TEXT DEFAULT '',
-            qc_timestamp TEXT
+            qc_note VARCHAR(MAX) DEFAULT '',
+            qc_actor VARCHAR(MAX) DEFAULT '',
+            qc_timestamp DATETIME
         )''')
-        slide_columns = {row['name'] for row in db.execute("PRAGMA table_info(slides)")}
+        slide_columns = {row['name'] for row in db.execute("SELECT COLUMN_NAME as name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='slides'")}
         for name, definition in {
             "qc_status": "TEXT",
             "qc_missing_tissue": "INTEGER DEFAULT 0",
@@ -195,39 +221,42 @@ def init_db():
             if name not in slide_columns:
                 db.execute(f"ALTER TABLE slides ADD {name} {definition}")
                 
-        db.execute('''CREATE TABLE IF NOT EXISTS slide_qc_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        db.execute('''IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='slide_qc_history' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='slide_qc_history' and xtype='U')
+CREATE TABLE slide_qc_history (
+            id INT IDENTITY(1,1) PRIMARY KEY,
             slide_id INT NOT NULL REFERENCES slides(id) ,
-            qc_status TEXT,
+            qc_status VARCHAR(MAX),
             qc_missing_tissue BIT,
             qc_blur BIT,
             qc_scan_artifact BIT,
             qc_incorrect_label BIT,
-            qc_note TEXT,
-            actor TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            qc_note VARCHAR(MAX),
+            actor VARCHAR(MAX) NOT NULL,
+            created_at VARCHAR(MAX) DEFAULT CURRENT_TIMESTAMP
         )''')
-        db.execute("CREATE INDEX IF NOT EXISTS idx_slide_qc_history_slide_id ON slide_qc_history(slide_id, id)")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_slides_case_id ON slides(case_id, id)")
+        db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_slide_qc_history_slide_id' AND object_id = OBJECT_ID('slide_qc_history')) CREATE INDEX idx_slide_qc_history_slide_id ON slide_qc_history(slide_id, id)")
+        db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_slides_case_id' AND object_id = OBJECT_ID('slides')) CREATE INDEX idx_slides_case_id ON slides(case_id, id)")
 
-        cursor = db.execute("PRAGMA table_info(annotations)")
+        cursor = db.execute("SELECT COLUMN_NAME as name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='annotations'")
         columns = [row['name'] for row in cursor.fetchall()]
         if columns and 'points' not in columns:
-            db.execute("""CREATE TABLE annotations_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            db.execute("""IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='annotations_new' and xtype='U')
+CREATE TABLE annotations_new (
+                id INT IDENTITY(1,1) PRIMARY KEY,
                 slide_id INT NOT NULL REFERENCES slides(id),
-                annotation_type TEXT NOT NULL DEFAULT 'rectangle'
+                annotation_type VARCHAR(MAX) NOT NULL DEFAULT 'rectangle'
                     CHECK (annotation_type IN ('rectangle', 'polygon', 'arrow')),
-                label TEXT NOT NULL,
-                note TEXT NOT NULL DEFAULT '',
-                color TEXT NOT NULL DEFAULT '#e85d75',
+                label VARCHAR(MAX) NOT NULL,
+                note VARCHAR(MAX) NOT NULL DEFAULT '',
+                color VARCHAR(MAX) NOT NULL DEFAULT '#e85d75',
                 x REAL,
                 y REAL,
                 width REAL,
                 height REAL,
-                points TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                points VARCHAR(MAX),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at VARCHAR(MAX) NOT NULL DEFAULT CURRENT_TIMESTAMP
             )""")
             db.execute("""INSERT INTO annotations_new 
                 (id, slide_id, annotation_type, label, note, color, x, y, width, height, created_at, updated_at)
@@ -235,82 +264,94 @@ def init_db():
                 FROM annotations""")
             db.execute("DROP TABLE annotations")
             db.execute("ALTER TABLE annotations_new RENAME TO annotations")
-            db.execute("CREATE INDEX IF NOT EXISTS idx_annotations_slide_id ON annotations(slide_id, id)")
+            db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_annotations_slide_id' AND object_id = OBJECT_ID('annotations')) CREATE INDEX idx_annotations_slide_id ON annotations(slide_id, id)")
         else:
-            db.execute("""CREATE TABLE IF NOT EXISTS annotations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            db.execute("""IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='annotations' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='annotations' and xtype='U')
+CREATE TABLE annotations (
+                id INT IDENTITY(1,1) PRIMARY KEY,
                 slide_id INT NOT NULL REFERENCES slides(id) ,
-                annotation_type TEXT NOT NULL DEFAULT 'rectangle'
+                annotation_type VARCHAR(MAX) NOT NULL DEFAULT 'rectangle'
                     CHECK (annotation_type IN ('rectangle', 'polygon', 'arrow')),
-                label TEXT NOT NULL,
-                note TEXT NOT NULL DEFAULT '',
-                color TEXT NOT NULL DEFAULT '#e85d75',
+                label VARCHAR(MAX) NOT NULL,
+                note VARCHAR(MAX) NOT NULL DEFAULT '',
+                color VARCHAR(MAX) NOT NULL DEFAULT '#e85d75',
                 x REAL,
                 y REAL,
                 width REAL,
                 height REAL,
-                points TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                points VARCHAR(MAX),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at VARCHAR(MAX) NOT NULL DEFAULT CURRENT_TIMESTAMP
             )""")
-            db.execute("CREATE INDEX IF NOT EXISTS idx_annotations_slide_id ON annotations(slide_id, id)")
+            db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_annotations_slide_id' AND object_id = OBJECT_ID('annotations')) CREATE INDEX idx_annotations_slide_id ON annotations(slide_id, id)")
 
-        db.execute("""CREATE TABLE IF NOT EXISTS case_review_notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        db.execute("""IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='case_review_notes' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='case_review_notes' and xtype='U')
+CREATE TABLE case_review_notes (
+            id INT IDENTITY(1,1) PRIMARY KEY,
             case_id INT NOT NULL REFERENCES cases(id) ,
-            author TEXT NOT NULL,
-            note TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            author VARCHAR(MAX) NOT NULL,
+            note VARCHAR(MAX) NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_case_review_notes_case_id ON case_review_notes(case_id, id)")
+        db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_case_review_notes_case_id' AND object_id = OBJECT_ID('case_review_notes')) CREATE INDEX idx_case_review_notes_case_id ON case_review_notes(case_id, id)")
 
-        db.execute("""CREATE TABLE IF NOT EXISTS case_review_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        db.execute("""IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='case_review_history' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='case_review_history' and xtype='U')
+CREATE TABLE case_review_history (
+            id INT IDENTITY(1,1) PRIMARY KEY,
             case_id INT NOT NULL REFERENCES cases(id) ,
-            change_type TEXT NOT NULL CHECK (change_type IN ('status', 'reviewer')),
-            previous_value TEXT NOT NULL,
-            new_value TEXT NOT NULL,
-            actor TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            change_type VARCHAR(MAX) NOT NULL CHECK (change_type IN ('status', 'reviewer')),
+            previous_value VARCHAR(MAX) NOT NULL,
+            new_value VARCHAR(MAX) NOT NULL,
+            actor VARCHAR(MAX) NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_case_review_history_case_id ON case_review_history(case_id, id)")
+        db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_case_review_history_case_id' AND object_id = OBJECT_ID('case_review_history')) CREATE INDEX idx_case_review_history_case_id ON case_review_history(case_id, id)")
 
-        db.execute("""CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        db.execute("""IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='reports' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='reports' and xtype='U')
+CREATE TABLE reports (
+            id INT IDENTITY(1,1) PRIMARY KEY,
             case_id INT NOT NULL REFERENCES cases(id) ,
             version INT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('Draft', 'Finalized')),
-            specimen_clinical TEXT NOT NULL DEFAULT '',
-            gross_description TEXT NOT NULL DEFAULT '',
-            microscopic_findings TEXT NOT NULL DEFAULT '',
-            diagnosis TEXT NOT NULL DEFAULT '',
-            comments TEXT NOT NULL DEFAULT '',
-            reviewer_name TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            finalized_at TEXT
+            status VARCHAR(MAX) NOT NULL CHECK (status IN ('Draft', 'Finalized')),
+            specimen_clinical VARCHAR(MAX) NOT NULL DEFAULT '',
+            gross_description VARCHAR(MAX) NOT NULL DEFAULT '',
+            microscopic_findings VARCHAR(MAX) NOT NULL DEFAULT '',
+            diagnosis VARCHAR(MAX) NOT NULL DEFAULT '',
+            comments VARCHAR(MAX) NOT NULL DEFAULT '',
+            reviewer_name VARCHAR(MAX) NOT NULL DEFAULT '',
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finalized_at VARCHAR(MAX)
         )""")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_reports_case_id ON reports(case_id, version DESC)")
+        db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_reports_case_id' AND object_id = OBJECT_ID('reports')) CREATE INDEX idx_reports_case_id ON reports(case_id, version DESC)")
 
-        db.execute("""CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            actor_username TEXT NOT NULL,
-            action TEXT NOT NULL,
-            target_type TEXT NOT NULL,
-            target_id TEXT NOT NULL DEFAULT '',
-            details TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        db.execute("""IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='audit_log' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='audit_log' and xtype='U')
+CREATE TABLE audit_log (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            actor_username VARCHAR(MAX) NOT NULL,
+            action VARCHAR(MAX) NOT NULL,
+            target_type VARCHAR(MAX) NOT NULL,
+            target_id VARCHAR(MAX) NOT NULL DEFAULT '',
+            details VARCHAR(MAX) NOT NULL DEFAULT '',
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at DESC)")
+        db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_audit_log_created_at' AND object_id = OBJECT_ID('audit_log')) CREATE INDEX idx_audit_log_created_at ON audit_log(created_at DESC)")
 
-        db.execute("""CREATE TABLE IF NOT EXISTS report_findings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        db.execute("""IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='report_findings' and xtype='U')
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='report_findings' and xtype='U')
+CREATE TABLE report_findings (
+            id INT IDENTITY(1,1) PRIMARY KEY,
             report_id INT NOT NULL REFERENCES reports(id) ,
             slide_id INT REFERENCES slides(id) ON DELETE SET NULL,
             annotation_id INT REFERENCES annotations(id) ON DELETE SET NULL,
-            text TEXT NOT NULL DEFAULT '',
+            text VARCHAR(MAX) NOT NULL DEFAULT '',
             sort_order INT NOT NULL DEFAULT 0
         )""")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_report_findings_report_id ON report_findings(report_id, sort_order)")
+        db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_report_findings_report_id' AND object_id = OBJECT_ID('report_findings')) CREATE INDEX idx_report_findings_report_id ON report_findings(report_id, sort_order)")
 
         # Lift legacy case rows: cases that have a non-empty filename but no
         # corresponding slide row yet get a Slide-1 entry inserted automatically.
@@ -631,7 +672,7 @@ def get_slide(slide_id: int):
 def first_slide(case_pk: int):
     get_case(case_pk)
     with closing(connect()) as db:
-        row = db.execute("SELECT * FROM slides WHERE case_id = ? ORDER BY id LIMIT 1", (case_pk,)).fetchone()
+        row = db.execute("SELECT TOP 1 * FROM slides WHERE case_id = ? ORDER BY id", (case_pk,)).fetchone()
     if row is None:
         raise HTTPException(404, "Case has no slides")
     return row
@@ -1310,14 +1351,14 @@ def create_draft_report(case_pk: int, current_user: dict = Depends(get_current_u
         
         # Determine next version
         latest = db.execute(
-            "SELECT version FROM reports WHERE case_id = ? ORDER BY version DESC LIMIT 1",
+            "SELECT TOP 1 version FROM reports WHERE case_id = ? ORDER BY version DESC",
             (case_pk,)
         ).fetchone()
         next_version = (latest["version"] + 1) if latest else 1
 
         # If there's a finalized previous version, copy its fields
         prev = db.execute(
-            "SELECT * FROM reports WHERE case_id = ? AND status = 'Finalized' ORDER BY version DESC LIMIT 1",
+            "SELECT TOP 1 * FROM reports WHERE case_id = ? AND status = 'Finalized' ORDER BY version DESC",
             (case_pk,)
         ).fetchone()
         

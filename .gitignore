@@ -1,0 +1,8 @@
+.env
+uploads/
+__pycache__/
+.pytest_cache/
+*.db
+pytest_tmp*/
+testdata/
+.venv/

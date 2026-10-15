@@ -10,3 +10,7 @@ fpdf2
 passlib[bcrypt]
 bcrypt<4.0
 pyjwt
+python-dotenv
+pyodbc
+pydantic-settings
+structlog

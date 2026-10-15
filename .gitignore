@@ -1,4 +1,4 @@
-.env
+
 uploads/
 __pycache__/
 .pytest_cache/
@@ -6,3 +6,4 @@ __pycache__/
 pytest_tmp*/
 testdata/
 .venv/
+.env

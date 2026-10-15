@@ -1,11 +1,15 @@
 from collections import OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager, closing, contextmanager
 from io import BytesIO
+from io import StringIO
+import csv
+import html
 import math
 import json
 import os
 import secrets
 import time
+import logging
 from pathlib import Path
 import pyodbc
 import os
@@ -98,8 +102,20 @@ class DBWrapper:
         driver = os.getenv("DB_DRIVER", "ODBC Driver 17 for SQL Server")
         server = os.getenv("DB_SERVER", "localhost")
         dbname = os.getenv("DB_NAME", "Hello")
-        conn_str = f"DRIVER={{{driver}}};SERVER={server};DATABASE={dbname};Trusted_Connection=yes;"
-        self.conn = pyodbc.connect(conn_str, autocommit=False)
+        trusted = env_bool("DB_TRUSTED_CONNECTION", True)
+        trust_certificate = env_bool("DB_TRUST_SERVER_CERTIFICATE", False)
+        timeout = int(os.getenv("DB_CONNECTION_TIMEOUT", "30"))
+        parts = [f"DRIVER={{{driver}}}", f"SERVER={server}", f"DATABASE={dbname}"]
+        if trusted:
+            parts.append("Trusted_Connection=yes")
+        else:
+            username = os.getenv("DB_USERNAME", "")
+            password = os.getenv("DB_PASSWORD", "")
+            if not username or not password:
+                raise RuntimeError("DB_USERNAME and DB_PASSWORD are required when trusted authentication is disabled")
+            parts.extend([f"UID={username}", f"PWD={password}"])
+        parts.append(f"TrustServerCertificate={'yes' if trust_certificate else 'no'}")
+        self.conn = pyodbc.connect(";".join(parts) + ";", autocommit=False, timeout=timeout)
     def execute(self, *args):
         cursor = self.conn.cursor()
         cursor.execute(*args)
@@ -154,7 +170,7 @@ CREATE TABLE users (
             db.execute("UPDATE users SET password = NULL")
             try:
                 db.execute("ALTER TABLE users DROP COLUMN password")
-            except sqlite3.OperationalError:
+            except pyodbc.Error:
                 pass
             
         db.execute("""
@@ -423,6 +439,28 @@ async def lifespan(_app):
 
 
 app = FastAPI(title=os.getenv("APP_NAME", "Pathology Demo API"), lifespan=lifespan)
+
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+request_logger = logging.getLogger("pathology.api")
+
+@app.middleware("http")
+async def request_observability(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid4().hex
+    started = time.perf_counter()
+    request.state.request_id = request_id
+    request_logger.info("request.start request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception:
+        request_logger.exception("request.failed request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
+        raise
+    duration_ms = round((time.perf_counter() - started) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
+    request_logger.info("request.complete request_id=%s method=%s path=%s status=%s duration_ms=%s", request_id, request.method, request.url.path, response.status_code, duration_ms)
+    return response
 
 
 SECRET_KEY = os.environ["JWT_SECRET_KEY"]
@@ -726,7 +764,7 @@ def require_wsi_slide(slide_id: int):
     return row, path
 
 
-@app.get("/api/status", dependencies=[Depends(require_roles(["Admin", "Technician", "Pathologist", "Viewer"]))])
+@app.get("/api/status")
 def api_status():
     return {
         "ok": True,
@@ -824,7 +862,7 @@ def assign_reviewer(case_pk: int, change: ReviewerChange, current_user: dict = D
 def add_slide_qc(slide_pk: int, qc: SlideQcUpdate, current_user: dict = Depends(get_current_user)):
     get_slide(slide_pk)
     actor = current_user["display_name"]
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     
     with closing(connect()) as db:
         db.execute('''UPDATE slides SET 
@@ -863,7 +901,7 @@ def change_case_status(case_pk: int, change: StatusChange, current_user: dict = 
         raise HTTPException(409, f"Unsupported status transition: {current} → {new_status}")
     if new_status == "In Review":
         with closing(connect()) as db:
-            needs_rescan = db.execute("SELECT COUNT(*) FROM slides WHERE case_id = ? AND qc_status = 'Needs rescan'", (case_pk,)).fetchone()['COUNT(*)']
+            needs_rescan = db.execute("SELECT COUNT(*) AS count FROM slides WHERE case_id = ? AND qc_status = 'Needs rescan'", (case_pk,)).fetchone()['count']
             if needs_rescan > 0:
                 raise HTTPException(409, "Cannot mark case ready for review while a slide needs a rescan")
     with closing(connect()) as db:
@@ -1023,7 +1061,7 @@ async def create_case(
             )
             db.commit()
             case_pk = cursor.lastrowid
-    except sqlite3.IntegrityError as exc:
+    except pyodbc.IntegrityError as exc:
         raise HTTPException(409, "Case ID already exists") from exc
 
     try:
@@ -1437,7 +1475,7 @@ def finalize_report(report_id: int):
         if report["status"] == "Finalized":
             return serialize_report(report)
             
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         db.execute("UPDATE reports SET status = 'Finalized', finalized_at = ? WHERE id = ?", (now, report_id))
         db.commit()
         row = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
@@ -1497,3 +1535,31 @@ def export_report_pdf(report_id: int):
     return Response(content=output, media_type="application/pdf", headers={
         "Content-Disposition": f"attachment; filename=report_{case['case_id']}_v{report['version']}.pdf"
     })
+
+@app.get("/api/reports/{report_id}/csv", dependencies=[Depends(require_roles(["Admin", "Technician", "Pathologist", "Viewer"]))])
+def export_report_csv(report_id: int):
+    with closing(connect()) as db:
+        report=db.execute("SELECT * FROM reports WHERE id=?",(report_id,)).fetchone()
+        if not report: raise HTTPException(404,"Report not found")
+        case=db.execute("SELECT case_id FROM cases WHERE id=?",(report["case_id"],)).fetchone()
+        findings=db.execute("SELECT * FROM report_findings WHERE report_id=? ORDER BY sort_order",(report_id,)).fetchall()
+    output=StringIO(); writer=csv.writer(output); writer.writerow(["case_id","report_version","status","reviewer","section","value","slide_id","annotation_id"])
+    for key,label in (("specimen_clinical","Specimen and clinical"),("gross_description","Gross description"),("microscopic_findings","Microscopic findings"),("diagnosis","Diagnosis"),("comments","Comments")):
+        writer.writerow([case["case_id"],report["version"],report["status"],report["reviewer_name"],label,report[key],"",""])
+    for finding in findings: writer.writerow([case["case_id"],report["version"],report["status"],report["reviewer_name"],"Finding",finding["text"],finding["slide_id"] or "",finding["annotation_id"] or ""])
+    return Response(output.getvalue(),media_type="text/csv",headers={"Content-Disposition":f"attachment; filename=report_{case['case_id']}_v{report['version']}.csv"})
+
+@app.get("/api/reports/{report_id}/html", dependencies=[Depends(require_roles(["Admin", "Technician", "Pathologist", "Viewer"]))])
+def export_report_html(report_id: int):
+    with closing(connect()) as db:
+        report=db.execute("SELECT * FROM reports WHERE id=?",(report_id,)).fetchone()
+        if not report: raise HTTPException(404,"Report not found")
+        case=db.execute("SELECT case_id FROM cases WHERE id=?",(report["case_id"],)).fetchone()
+    sections="".join(f"<section><h2>{html.escape(label)}</h2><p>{html.escape(str(report[key] or ''))}</p></section>" for key,label in (("specimen_clinical","Specimen and clinical"),("gross_description","Gross description"),("microscopic_findings","Microscopic findings"),("diagnosis","Diagnosis"),("comments","Comments")))
+    document=f"<!doctype html><html><head><meta charset='utf-8'><title>Report {html.escape(case['case_id'])}</title></head><body><main><h1>Pathology report</h1><p>Case {html.escape(case['case_id'])} · Version {report['version']} · {html.escape(report['status'])}</p>{sections}<footer>Reviewer: {html.escape(report['reviewer_name'])}</footer></main></body></html>"
+    return Response(document,media_type="text/html",headers={"Content-Disposition":f"attachment; filename=report_{case['case_id']}_v{report['version']}.html"})
+
+
+from platform_api import create_platform_router, init_platform_schema
+init_platform_schema(connect)
+app.include_router(create_platform_router(connect, require_roles, get_current_user, UPLOADS))

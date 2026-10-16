@@ -50,14 +50,14 @@ def client(sql_test_database, tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'UPLOADS', uploads)
     main.slide_cache.clear()
     with main.connect() as db:
-        for table in ('audit_log','report_findings','reports','case_review_history','case_review_notes','annotations','slide_qc_history','slides','cases','users'):
+        for table in ('research_folder_access','research_folder_members','research_folders','case_links','case_operations','viewer_bookmarks','viewer_preferences','case_consultations','report_reviews','report_findings','reports','report_templates','annotation_revisions','annotations','ai_results','ai_jobs','image_metadata_revisions','image_versions','reconciliation_items','ingestion_jobs','audit_log','case_review_history','case_review_notes','slide_qc_history','slides','blocks','specimens','accessions','patients','cases','users'):
             if db.execute("SELECT OBJECT_ID(?, 'U') AS id", (table,)).fetchone()['id']:
                 db.execute(f'DELETE FROM [{table}]')
         password_hash = main.get_password_hash('test-password-123')
-        db.execute("INSERT INTO users (username,display_name,role,password_hash,is_active) VALUES (?,?,?,?,1)", ('admin','Test Administrator','Admin',password_hash))
+        db.execute("INSERT INTO users (username,display_name,role,password_hash,is_active) VALUES (?,?,?,?,1)", ('admin','Test Administrator','System Administrator',password_hash))
         db.commit()
     test_client = TestClient(main.app)
-    token = main.create_access_token({'sub':'admin','role':'Admin'})
+    token = main.create_access_token({'sub':'admin','role':'System Administrator'})
     test_client.cookies.set('access_token', token)
     test_client.cookies.set('csrf_token', 'test-csrf-token')
     test_client.headers.update({'X-CSRF-Token':'test-csrf-token'})

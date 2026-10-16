@@ -10,6 +10,12 @@ SET NOCOUNT ON;
 SET XACT_ABORT ON;
 GO
 
+IF OBJECT_ID('dbo.slides','U') IS NOT NULL AND COL_LENGTH('dbo.slides', 'qc_unusual_staining') IS NULL
+    ALTER TABLE dbo.slides ADD qc_unusual_staining INT NULL CONSTRAINT DF_slides_qc_staining_existing DEFAULT (0);
+IF OBJECT_ID('dbo.slide_qc_history','U') IS NOT NULL AND COL_LENGTH('dbo.slide_qc_history', 'qc_unusual_staining') IS NULL
+    ALTER TABLE dbo.slide_qc_history ADD qc_unusual_staining BIT NULL;
+GO
+
 IF OBJECT_ID('dbo.users', 'U') IS NULL
 CREATE TABLE dbo.users (
     id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_users PRIMARY KEY,
@@ -21,6 +27,18 @@ CREATE TABLE dbo.users (
     created_at VARCHAR(MAX) NULL CONSTRAINT DF_users_created DEFAULT (CURRENT_TIMESTAMP),
     last_login DATETIME NULL
 );
+GO
+
+-- Idempotent migration from the original prototype role names.
+UPDATE dbo.users SET role = 'System Administrator' WHERE role = 'Admin';
+UPDATE dbo.users SET role = 'Histotechnologist' WHERE role = 'Technician';
+UPDATE dbo.users SET role = 'Auditor' WHERE role = 'Viewer';
+IF NOT EXISTS (SELECT 1 FROM dbo.users WHERE LOWER(username) = 'etdadmin')
+    UPDATE dbo.users SET username = 'ETDadmin' WHERE LOWER(username) = 'eidadmin';
+UPDATE dbo.users SET role = 'Super Administrator' WHERE LOWER(username) IN ('etddev', 'etdadmin');
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_users_super_admin_reserved')
+    ALTER TABLE dbo.users ADD CONSTRAINT CK_users_super_admin_reserved
+        CHECK (role <> 'Super Administrator' OR LOWER(username) IN ('etddev', 'etdadmin'));
 GO
 
 IF OBJECT_ID('dbo.cases', 'U') IS NULL
@@ -62,6 +80,7 @@ CREATE TABLE dbo.slides (
     qc_blur INT NULL CONSTRAINT DF_slides_qc_blur DEFAULT (0),
     qc_scan_artifact INT NULL CONSTRAINT DF_slides_qc_artifact DEFAULT (0),
     qc_incorrect_label INT NULL CONSTRAINT DF_slides_qc_label DEFAULT (0),
+    qc_unusual_staining INT NULL CONSTRAINT DF_slides_qc_staining DEFAULT (0),
     qc_note VARCHAR(MAX) NULL CONSTRAINT DF_slides_qc_note DEFAULT (''),
     qc_actor VARCHAR(MAX) NULL CONSTRAINT DF_slides_qc_actor DEFAULT (''),
     qc_timestamp DATETIME NULL,
@@ -78,10 +97,17 @@ CREATE TABLE dbo.slide_qc_history (
     qc_blur BIT NULL,
     qc_scan_artifact BIT NULL,
     qc_incorrect_label BIT NULL,
+    qc_unusual_staining BIT NULL,
     qc_note VARCHAR(MAX) NULL,
     actor VARCHAR(MAX) NOT NULL,
     created_at VARCHAR(MAX) NULL CONSTRAINT DF_slide_qc_history_created DEFAULT (CURRENT_TIMESTAMP)
 );
+GO
+
+IF COL_LENGTH('dbo.slides', 'qc_unusual_staining') IS NULL
+    ALTER TABLE dbo.slides ADD qc_unusual_staining INT NULL CONSTRAINT DF_slides_qc_staining_existing DEFAULT (0);
+IF COL_LENGTH('dbo.slide_qc_history', 'qc_unusual_staining') IS NULL
+    ALTER TABLE dbo.slide_qc_history ADD qc_unusual_staining BIT NULL;
 GO
 
 IF OBJECT_ID('dbo.annotations', 'U') IS NULL
@@ -96,7 +122,7 @@ CREATE TABLE dbo.annotations (
     points VARCHAR(MAX) NULL,
     created_at DATETIME NOT NULL CONSTRAINT DF_annotations_created DEFAULT (CURRENT_TIMESTAMP),
     updated_at VARCHAR(MAX) NOT NULL CONSTRAINT DF_annotations_updated DEFAULT (CURRENT_TIMESTAMP),
-    CONSTRAINT CK_annotations_type CHECK (annotation_type IN ('rectangle','polygon','arrow'))
+    CONSTRAINT CK_annotations_type CHECK (annotation_type IN ('point','line','polygon','rectangle','ellipse','freehand','arrow'))
 );
 GO
 
@@ -149,8 +175,17 @@ CREATE TABLE dbo.audit_log (
     target_type VARCHAR(MAX) NOT NULL,
     target_id VARCHAR(MAX) NOT NULL CONSTRAINT DF_audit_target DEFAULT (''),
     details VARCHAR(MAX) NOT NULL CONSTRAINT DF_audit_details DEFAULT (''),
+    ip_address VARCHAR(45) NULL,
+    device_name VARCHAR(255) NULL,
+    device_location VARCHAR(255) NULL,
+    user_agent VARCHAR(1000) NULL,
     created_at DATETIME NOT NULL CONSTRAINT DF_audit_created DEFAULT (CURRENT_TIMESTAMP)
 );
+GO
+IF COL_LENGTH('dbo.audit_log','ip_address') IS NULL ALTER TABLE dbo.audit_log ADD ip_address VARCHAR(45) NULL;
+IF COL_LENGTH('dbo.audit_log','device_name') IS NULL ALTER TABLE dbo.audit_log ADD device_name VARCHAR(255) NULL;
+IF COL_LENGTH('dbo.audit_log','device_location') IS NULL ALTER TABLE dbo.audit_log ADD device_location VARCHAR(255) NULL;
+IF COL_LENGTH('dbo.audit_log','user_agent') IS NULL ALTER TABLE dbo.audit_log ADD user_agent VARCHAR(1000) NULL;
 GO
 
 IF OBJECT_ID('dbo.report_findings', 'U') IS NULL
@@ -176,6 +211,7 @@ GO
 IF OBJECT_ID('dbo.accessions', 'U') IS NULL
 CREATE TABLE dbo.accessions (
     id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_accessions PRIMARY KEY,
+    case_id INT NULL CONSTRAINT FK_accessions_case REFERENCES dbo.cases(id),
     patient_id INT NULL CONSTRAINT FK_accessions_patient REFERENCES dbo.patients(id),
     accession_number VARCHAR(255) NOT NULL CONSTRAINT UQ_accessions_number UNIQUE,
     order_id VARCHAR(255) NULL,
@@ -183,6 +219,10 @@ CREATE TABLE dbo.accessions (
     due_at DATETIME2 NULL,
     created_at DATETIME2 NOT NULL CONSTRAINT DF_accessions_created DEFAULT (SYSUTCDATETIME())
 );
+GO
+
+IF COL_LENGTH('dbo.accessions', 'case_id') IS NULL
+    ALTER TABLE dbo.accessions ADD case_id INT NULL CONSTRAINT FK_accessions_case_existing REFERENCES dbo.cases(id);
 GO
 
 IF OBJECT_ID('dbo.specimens', 'U') IS NULL
@@ -206,6 +246,84 @@ CREATE TABLE dbo.blocks (
 );
 GO
 
+IF COL_LENGTH('dbo.cases', 'priority') IS NULL ALTER TABLE dbo.cases ADD priority VARCHAR(30) NOT NULL CONSTRAINT DF_cases_priority_existing DEFAULT ('Routine');
+IF COL_LENGTH('dbo.cases', 'due_at') IS NULL ALTER TABLE dbo.cases ADD due_at DATETIME2 NULL;
+IF COL_LENGTH('dbo.cases', 'exception_reason') IS NULL ALTER TABLE dbo.cases ADD exception_reason VARCHAR(2000) NULL;
+IF COL_LENGTH('dbo.slides', 'block_id') IS NULL ALTER TABLE dbo.slides ADD block_id INT NULL CONSTRAINT FK_slides_block REFERENCES dbo.blocks(id);
+IF COL_LENGTH('dbo.slides', 'slide_identifier') IS NULL ALTER TABLE dbo.slides ADD slide_identifier VARCHAR(255) NULL;
+IF COL_LENGTH('dbo.slides', 'scanner_name') IS NULL ALTER TABLE dbo.slides ADD scanner_name VARCHAR(255) NULL;
+GO
+
+IF OBJECT_ID('dbo.case_links', 'U') IS NULL
+CREATE TABLE dbo.case_links (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_case_links PRIMARY KEY,
+    case_id INT NOT NULL CONSTRAINT FK_case_links_case REFERENCES dbo.cases(id),
+    related_case_id INT NOT NULL CONSTRAINT FK_case_links_related REFERENCES dbo.cases(id),
+    link_type VARCHAR(30) NOT NULL, reason VARCHAR(2000) NULL, created_by VARCHAR(255) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_case_links_created DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT UQ_case_links UNIQUE(case_id, related_case_id, link_type)
+);
+GO
+
+IF OBJECT_ID('dbo.research_folders', 'U') IS NULL
+CREATE TABLE dbo.research_folders (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_research_folders PRIMARY KEY,
+    name VARCHAR(255) NOT NULL, description VARCHAR(2000) NULL, created_by VARCHAR(255) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_research_folders_created DEFAULT (SYSUTCDATETIME())
+);
+IF OBJECT_ID('dbo.research_folder_members', 'U') IS NULL
+CREATE TABLE dbo.research_folder_members (
+    folder_id INT NOT NULL CONSTRAINT FK_research_members_folder REFERENCES dbo.research_folders(id),
+    case_id INT NOT NULL CONSTRAINT FK_research_members_case REFERENCES dbo.cases(id), added_by VARCHAR(255) NOT NULL,
+    added_at DATETIME2 NOT NULL CONSTRAINT DF_research_members_added DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT PK_research_folder_members PRIMARY KEY(folder_id, case_id)
+);
+IF OBJECT_ID('dbo.research_folder_access', 'U') IS NULL
+CREATE TABLE dbo.research_folder_access (
+    folder_id INT NOT NULL CONSTRAINT FK_research_access_folder REFERENCES dbo.research_folders(id),
+    role_name VARCHAR(80) NOT NULL, granted_by VARCHAR(255) NOT NULL,
+    granted_at DATETIME2 NOT NULL CONSTRAINT DF_research_access_granted DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT PK_research_folder_access PRIMARY KEY(folder_id, role_name)
+);
+GO
+
+IF OBJECT_ID('dbo.case_operations', 'U') IS NULL
+CREATE TABLE dbo.case_operations (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_case_operations PRIMARY KEY,
+    operation_type VARCHAR(30) NOT NULL, source_case_id INT NOT NULL CONSTRAINT FK_case_operations_source REFERENCES dbo.cases(id),
+    target_case_id INT NULL CONSTRAINT FK_case_operations_target REFERENCES dbo.cases(id), details_json VARCHAR(MAX) NOT NULL,
+    authorized_by VARCHAR(255) NOT NULL, created_at DATETIME2 NOT NULL CONSTRAINT DF_case_operations_created DEFAULT (SYSUTCDATETIME())
+);
+GO
+
+IF OBJECT_ID('dbo.viewer_bookmarks', 'U') IS NULL
+CREATE TABLE dbo.viewer_bookmarks (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_viewer_bookmarks PRIMARY KEY,
+    slide_id INT NOT NULL CONSTRAINT FK_viewer_bookmarks_slide REFERENCES dbo.slides(id), name VARCHAR(120) NOT NULL,
+    viewport_x FLOAT NOT NULL, viewport_y FLOAT NOT NULL, viewport_width FLOAT NOT NULL, viewport_height FLOAT NOT NULL,
+    rotation FLOAT NOT NULL CONSTRAINT DF_viewer_bookmarks_rotation DEFAULT (0), created_by VARCHAR(255) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_viewer_bookmarks_created DEFAULT (SYSUTCDATETIME())
+);
+GO
+
+IF OBJECT_ID('dbo.viewer_preferences', 'U') IS NULL
+CREATE TABLE dbo.viewer_preferences (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_viewer_preferences PRIMARY KEY,
+    slide_id INT NOT NULL CONSTRAINT FK_viewer_preferences_slide REFERENCES dbo.slides(id),
+    username VARCHAR(255) NOT NULL, settings_json VARCHAR(MAX) NOT NULL,
+    updated_at DATETIME2 NOT NULL CONSTRAINT DF_viewer_preferences_updated DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT UQ_viewer_preferences UNIQUE(slide_id,username),
+    CONSTRAINT CK_viewer_preferences_json CHECK (ISJSON(settings_json)=1)
+);
+GO
+
+IF COL_LENGTH('dbo.reports', 'workflow_status') IS NULL ALTER TABLE dbo.reports ADD workflow_status VARCHAR(30) NOT NULL CONSTRAINT DF_reports_workflow_existing DEFAULT ('Draft'), approved_by VARCHAR(255) NULL, approved_at DATETIME2 NULL, review_comment VARCHAR(4000) NULL, template_id INT NULL;
+GO
+IF OBJECT_ID('dbo.report_templates','U') IS NULL CREATE TABLE dbo.report_templates (id INT IDENTITY PRIMARY KEY,name VARCHAR(255) UNIQUE NOT NULL,sections_json VARCHAR(MAX) NOT NULL,active BIT NOT NULL DEFAULT 1,created_by VARCHAR(255) NOT NULL,created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+IF OBJECT_ID('dbo.report_reviews','U') IS NULL CREATE TABLE dbo.report_reviews (id INT IDENTITY PRIMARY KEY,report_id INT NOT NULL REFERENCES dbo.reports(id),previous_status VARCHAR(30),new_status VARCHAR(30) NOT NULL,comment VARCHAR(4000),actor VARCHAR(255) NOT NULL,created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME());
+IF OBJECT_ID('dbo.case_consultations','U') IS NULL CREATE TABLE dbo.case_consultations (id INT IDENTITY PRIMARY KEY,case_id INT NOT NULL REFERENCES dbo.cases(id),requested_by VARCHAR(255) NOT NULL,consultant_username VARCHAR(255) NOT NULL,message VARCHAR(4000),status VARCHAR(30) NOT NULL DEFAULT 'Open',created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),completed_at DATETIME2 NULL);
+GO
+
 IF OBJECT_ID('dbo.ingestion_jobs', 'U') IS NULL
 CREATE TABLE dbo.ingestion_jobs (
     id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_ingestion_jobs PRIMARY KEY,
@@ -221,10 +339,23 @@ CREATE TABLE dbo.ingestion_jobs (
     progress INT NOT NULL CONSTRAINT DF_ingestion_progress DEFAULT (0),
     error_detail VARCHAR(MAX) NULL,
     quarantine_path VARCHAR(2048) NULL,
+    validation_json VARCHAR(MAX) NULL,
+    match_identifier VARCHAR(255) NULL,
+    matched_case_id INT NULL CONSTRAINT FK_ingestion_case REFERENCES dbo.cases(id),
+    match_method VARCHAR(80) NULL,
+    stored_filename VARCHAR(512) NULL,
+    imported_by VARCHAR(255) NULL,
     created_at DATETIME2 NOT NULL CONSTRAINT DF_ingestion_created DEFAULT (SYSUTCDATETIME()),
     started_at DATETIME2 NULL,
     completed_at DATETIME2 NULL
 );
+GO
+
+IF COL_LENGTH('dbo.ingestion_jobs', 'validation_json') IS NULL
+    ALTER TABLE dbo.ingestion_jobs ADD validation_json VARCHAR(MAX) NULL;
+GO
+IF COL_LENGTH('dbo.ingestion_jobs', 'match_identifier') IS NULL
+    ALTER TABLE dbo.ingestion_jobs ADD match_identifier VARCHAR(255) NULL, matched_case_id INT NULL CONSTRAINT FK_ingestion_case_existing REFERENCES dbo.cases(id), match_method VARCHAR(80) NULL, stored_filename VARCHAR(512) NULL, imported_by VARCHAR(255) NULL;
 GO
 
 IF OBJECT_ID('dbo.image_versions', 'U') IS NULL
@@ -258,6 +389,19 @@ CREATE TABLE dbo.reconciliation_items (
     resolved_by VARCHAR(255) NULL,
     created_at DATETIME2 NOT NULL CONSTRAINT DF_reconciliation_created DEFAULT (SYSUTCDATETIME()),
     resolved_at DATETIME2 NULL
+);
+GO
+
+IF OBJECT_ID('dbo.image_metadata_revisions', 'U') IS NULL
+CREATE TABLE dbo.image_metadata_revisions (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_image_metadata_revisions PRIMARY KEY,
+    image_version_id INT NOT NULL CONSTRAINT FK_metadata_revision_version REFERENCES dbo.image_versions(id),
+    field_name VARCHAR(120) NOT NULL,
+    original_value VARCHAR(MAX) NULL,
+    corrected_value VARCHAR(MAX) NULL,
+    editor VARCHAR(255) NOT NULL,
+    reason VARCHAR(2000) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_metadata_revision_created DEFAULT (SYSUTCDATETIME())
 );
 GO
 
@@ -329,6 +473,27 @@ CREATE TABLE dbo.ai_results (
 );
 GO
 
+IF COL_LENGTH('dbo.annotations', 'image_version_id') IS NULL ALTER TABLE dbo.annotations ADD image_version_id INT NULL CONSTRAINT FK_annotations_image_version REFERENCES dbo.image_versions(id);
+IF COL_LENGTH('dbo.annotations', 'category') IS NULL ALTER TABLE dbo.annotations ADD category VARCHAR(120) NULL, annotation_status VARCHAR(30) NULL, author VARCHAR(255) NULL, source_type VARCHAR(30) NOT NULL CONSTRAINT DF_annotations_source_existing DEFAULT ('Human'), source_ai_result_id INT NULL CONSTRAINT FK_annotations_ai_result REFERENCES dbo.ai_results(id), measurements_json VARCHAR(MAX) NULL;
+GO
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE parent_object_id=OBJECT_ID('dbo.annotations') AND definition LIKE '%annotation_type%' AND name<>'CK_annotations_supported_type')
+BEGIN
+    DECLARE @annotation_check SYSNAME;
+    SELECT TOP 1 @annotation_check=name FROM sys.check_constraints WHERE parent_object_id=OBJECT_ID('dbo.annotations') AND definition LIKE '%annotation_type%' AND name<>'CK_annotations_supported_type';
+    EXEC('ALTER TABLE dbo.annotations DROP CONSTRAINT [' + @annotation_check + ']');
+END;
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_annotations_supported_type')
+    ALTER TABLE dbo.annotations ADD CONSTRAINT CK_annotations_supported_type CHECK (annotation_type IN ('point','line','polygon','rectangle','ellipse','freehand','arrow'));
+GO
+IF OBJECT_ID('dbo.annotation_revisions', 'U') IS NULL
+CREATE TABLE dbo.annotation_revisions (
+    id INT IDENTITY(1,1) PRIMARY KEY, annotation_id INT NOT NULL REFERENCES dbo.annotations(id), revision_number INT NOT NULL,
+    geometry_json VARCHAR(MAX) NOT NULL, label VARCHAR(120) NOT NULL, note VARCHAR(2000) NULL, category VARCHAR(120) NULL,
+    annotation_status VARCHAR(30) NULL, changed_by VARCHAR(255) NOT NULL, change_reason VARCHAR(2000) NULL,
+    created_at DATETIME2 NOT NULL DEFAULT (SYSUTCDATETIME()), CONSTRAINT UQ_annotation_revision UNIQUE(annotation_id,revision_number)
+);
+GO
+
 IF OBJECT_ID('dbo.hl7_channels', 'U') IS NULL
 CREATE TABLE dbo.hl7_channels (
     id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_hl7_channels PRIMARY KEY,
@@ -397,4 +562,13 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_report_findings_report_
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_ingestion_checksum' AND object_id=OBJECT_ID('dbo.ingestion_jobs')) CREATE INDEX idx_ingestion_checksum ON dbo.ingestion_jobs(checksum_sha256,status);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_ai_jobs_status' AND object_id=OBJECT_ID('dbo.ai_jobs')) CREATE INDEX idx_ai_jobs_status ON dbo.ai_jobs(status,created_at);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_integration_events_status' AND object_id=OBJECT_ID('dbo.integration_events')) CREATE INDEX idx_integration_events_status ON dbo.integration_events(status,created_at);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_accessions_case_identifiers' AND object_id=OBJECT_ID('dbo.accessions')) CREATE INDEX idx_accessions_case_identifiers ON dbo.accessions(case_id,accession_number,order_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_specimens_accession' AND object_id=OBJECT_ID('dbo.specimens')) CREATE INDEX idx_specimens_accession ON dbo.specimens(accession_id,specimen_type);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_blocks_specimen' AND object_id=OBJECT_ID('dbo.blocks')) CREATE INDEX idx_blocks_specimen ON dbo.blocks(specimen_id,block_code);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_case_links_case' AND object_id=OBJECT_ID('dbo.case_links')) CREATE INDEX idx_case_links_case ON dbo.case_links(case_id,related_case_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_viewer_bookmarks_slide' AND object_id=OBJECT_ID('dbo.viewer_bookmarks')) CREATE INDEX idx_viewer_bookmarks_slide ON dbo.viewer_bookmarks(slide_id,id DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_viewer_preferences_user' AND object_id=OBJECT_ID('dbo.viewer_preferences')) CREATE INDEX idx_viewer_preferences_user ON dbo.viewer_preferences(username,updated_at DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_annotation_revisions_annotation' AND object_id=OBJECT_ID('dbo.annotation_revisions')) CREATE INDEX idx_annotation_revisions_annotation ON dbo.annotation_revisions(annotation_id,revision_number DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_report_reviews_report' AND object_id=OBJECT_ID('dbo.report_reviews')) CREATE INDEX idx_report_reviews_report ON dbo.report_reviews(report_id,id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_consultations_case' AND object_id=OBJECT_ID('dbo.case_consultations')) CREATE INDEX idx_consultations_case ON dbo.case_consultations(case_id,status);
 GO

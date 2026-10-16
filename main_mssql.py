@@ -1,4 +1,5 @@
 from collections import OrderedDict, defaultdict, deque
+import asyncio
 from contextlib import asynccontextmanager, closing, contextmanager
 from io import BytesIO
 from io import StringIO
@@ -27,6 +28,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from PIL import Image, UnidentifiedImageError
+from image_validation import ImageValidationError, validate_image_file
+from audit_context import get_audit_context, reset_audit_context, set_audit_context
 
 BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
@@ -172,6 +175,12 @@ CREATE TABLE users (
                 db.execute("ALTER TABLE users DROP COLUMN password")
             except pyodbc.Error:
                 pass
+        db.execute("UPDATE users SET role = 'System Administrator' WHERE role = 'Admin'")
+        db.execute("UPDATE users SET role = 'Histotechnologist' WHERE role = 'Technician'")
+        db.execute("UPDATE users SET role = 'Auditor' WHERE role = 'Viewer'")
+        db.execute("UPDATE users SET username = 'ETDadmin' WHERE LOWER(username) = 'eidadmin' AND NOT EXISTS (SELECT 1 FROM users WHERE LOWER(username) = 'etdadmin')")
+        db.execute("UPDATE users SET role = 'Super Administrator' WHERE LOWER(username) IN ('etddev', 'etdadmin')")
+        db.execute("IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_users_super_admin_reserved') ALTER TABLE users ADD CONSTRAINT CK_users_super_admin_reserved CHECK (role <> 'Super Administrator' OR LOWER(username) IN ('etddev','etdadmin'))")
             
         db.execute("""
             IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='cases' and xtype='U')
@@ -219,6 +228,7 @@ CREATE TABLE slides (
             qc_blur INTEGER DEFAULT 0,
             qc_scan_artifact INTEGER DEFAULT 0,
             qc_incorrect_label INTEGER DEFAULT 0,
+            qc_unusual_staining INTEGER DEFAULT 0,
             qc_note VARCHAR(MAX) DEFAULT '',
             qc_actor VARCHAR(MAX) DEFAULT '',
             qc_timestamp DATETIME
@@ -230,6 +240,7 @@ CREATE TABLE slides (
             "qc_blur": "INTEGER DEFAULT 0",
             "qc_scan_artifact": "INTEGER DEFAULT 0",
             "qc_incorrect_label": "INTEGER DEFAULT 0",
+            "qc_unusual_staining": "INTEGER DEFAULT 0",
             "qc_note": "TEXT DEFAULT ''",
             "qc_actor": "TEXT DEFAULT ''",
             "qc_timestamp": "TEXT",
@@ -247,11 +258,13 @@ CREATE TABLE slide_qc_history (
             qc_blur BIT,
             qc_scan_artifact BIT,
             qc_incorrect_label BIT,
+            qc_unusual_staining BIT,
             qc_note VARCHAR(MAX),
             actor VARCHAR(MAX) NOT NULL,
             created_at VARCHAR(MAX) DEFAULT CURRENT_TIMESTAMP
         )''')
         db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_slide_qc_history_slide_id' AND object_id = OBJECT_ID('slide_qc_history')) CREATE INDEX idx_slide_qc_history_slide_id ON slide_qc_history(slide_id, id)")
+        db.execute("IF COL_LENGTH('slide_qc_history','qc_unusual_staining') IS NULL ALTER TABLE slide_qc_history ADD qc_unusual_staining BIT NULL")
         db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_slides_case_id' AND object_id = OBJECT_ID('slides')) CREATE INDEX idx_slides_case_id ON slides(case_id, id)")
 
         cursor = db.execute("SELECT COLUMN_NAME as name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='annotations'")
@@ -353,8 +366,16 @@ CREATE TABLE audit_log (
             target_type VARCHAR(MAX) NOT NULL,
             target_id VARCHAR(MAX) NOT NULL DEFAULT '',
             details VARCHAR(MAX) NOT NULL DEFAULT '',
+            ip_address VARCHAR(45) NULL,
+            device_name VARCHAR(255) NULL,
+            device_location VARCHAR(255) NULL,
+            user_agent VARCHAR(1000) NULL,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
+        db.execute("IF COL_LENGTH('audit_log','ip_address') IS NULL ALTER TABLE audit_log ADD ip_address VARCHAR(45) NULL")
+        db.execute("IF COL_LENGTH('audit_log','device_name') IS NULL ALTER TABLE audit_log ADD device_name VARCHAR(255) NULL")
+        db.execute("IF COL_LENGTH('audit_log','device_location') IS NULL ALTER TABLE audit_log ADD device_location VARCHAR(255) NULL")
+        db.execute("IF COL_LENGTH('audit_log','user_agent') IS NULL ALTER TABLE audit_log ADD user_agent VARCHAR(1000) NULL")
         db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_audit_log_created_at' AND object_id = OBJECT_ID('audit_log')) CREATE INDEX idx_audit_log_created_at ON audit_log(created_at DESC)")
 
         db.execute("""IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='report_findings' and xtype='U')
@@ -398,44 +419,103 @@ init_db()
 
 
 class SlideCache:
-    """Bounded LRU; one lock per OpenSlide handle prevents concurrent use."""
+    """Bounded LRU; caches OpenSlide handles and DeepZoomGenerator instances."""
 
     def __init__(self, capacity=4):
         self.capacity = capacity
         self._entries = OrderedDict()
         self._cache_lock = RLock()
 
-    @contextmanager
-    def acquire(self, path: Path):
+    def _get_entry(self, path: Path):
         key = str(path)
         with self._cache_lock:
             entry = self._entries.get(key)
             if entry is None:
-                entry = (openslide.OpenSlide(key), RLock())
+                slide = openslide.OpenSlide(key)
+                deep_zoom = DeepZoomGenerator(slide, tile_size=TILE_SIZE, overlap=TILE_OVERLAP)
+                entry = {
+                    "slide": slide,
+                    "deep_zoom": deep_zoom,
+                    "lock": RLock(),
+                }
                 self._entries[key] = entry
                 while len(self._entries) > self.capacity:
-                    _, (old_slide, _) = self._entries.popitem(last=False)
-                    old_slide.close()
+                    _, old_entry = self._entries.popitem(last=False)
+                    old_entry["slide"].close()
             else:
                 self._entries.move_to_end(key)
-        slide, slide_lock = entry
-        with slide_lock:
-            yield slide
+            return entry
+
+    @contextmanager
+    def acquire(self, path: Path):
+        entry = self._get_entry(path)
+        with entry["lock"]:
+            yield entry["slide"]
+
+    @contextmanager
+    def acquire_generator(self, path: Path):
+        entry = self._get_entry(path)
+        with entry["lock"]:
+            yield entry["deep_zoom"]
 
     def clear(self):
         with self._cache_lock:
-            for slide, _ in self._entries.values():
-                slide.close()
+            for entry in self._entries.values():
+                entry["slide"].close()
             self._entries.clear()
+        clear_tile_cache()
+        clear_slide_meta_cache()
 
 
 slide_cache = SlideCache(int(os.getenv("OPENSLIDE_CACHE_SIZE", "4")))
 
+TILE_CACHE_CAPACITY = int(os.getenv("TILE_CACHE_CAPACITY", "1000"))
+_tile_cache = OrderedDict()
+_tile_cache_lock = RLock()
+
+def get_cached_tile(slide_id: int, level: int, col: int, row: int):
+    key = (slide_id, level, col, row)
+    with _tile_cache_lock:
+        if key in _tile_cache:
+            _tile_cache.move_to_end(key)
+            return _tile_cache[key]
+    return None
+
+def set_cached_tile(slide_id: int, level: int, col: int, row: int, data: bytes):
+    key = (slide_id, level, col, row)
+    with _tile_cache_lock:
+        _tile_cache[key] = data
+        if len(_tile_cache) > TILE_CACHE_CAPACITY:
+            _tile_cache.popitem(last=False)
+
+def clear_tile_cache():
+    with _tile_cache_lock:
+        _tile_cache.clear()
+
+_slide_meta_cache = {}
+_slide_meta_lock = RLock()
+
+def get_cached_wsi_slide(slide_id: int):
+    with _slide_meta_lock:
+        if slide_id in _slide_meta_cache:
+            return _slide_meta_cache[slide_id]
+    row, path = require_wsi_slide(slide_id)
+    with _slide_meta_lock:
+        _slide_meta_cache[slide_id] = (row, path)
+    return row, path
+
+def clear_slide_meta_cache():
+    with _slide_meta_lock:
+        _slide_meta_cache.clear()
+
 
 @asynccontextmanager
 async def lifespan(_app):
-    yield
-    slide_cache.clear()
+    from platform_api import watched_folder_loop
+    stop_event=asyncio.Event(); watcher=asyncio.create_task(watched_folder_loop(connect,stop_event))
+    try: yield
+    finally:
+        stop_event.set(); await watcher; slide_cache.clear()
 
 
 app = FastAPI(title=os.getenv("APP_NAME", "Pathology Demo API"), lifespan=lifespan)
@@ -451,12 +531,40 @@ async def request_observability(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or uuid4().hex
     started = time.perf_counter()
     request.state.request_id = request_id
+    forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    real_ip = request.headers.get("X-Real-IP", "").strip()
+    device_ip = request.headers.get("X-Device-IP", "").strip()
+    client_ip = (device_ip or forwarded or real_ip) if env_bool("TRUST_PROXY_HEADERS", False) else ""
+    if not client_ip:
+        client_ip = (request.client.host if request.client else "") or device_ip or forwarded or real_ip or "127.0.0.1"
+
+    device_name = request.headers.get("X-Device-Name", "").strip()[:255]
+    device_location = request.headers.get("X-Device-Location", "").strip()[:255]
+    user_agent = request.headers.get("User-Agent", "").strip()[:1000]
+
+    if not device_location:
+        if client_ip in ("127.0.0.1", "::1", "localhost", "testclient"):
+            device_location = "Local Workstation"
+        else:
+            device_location = "Remote Network"
+
+    if not device_name:
+        device_name = "Workstation"
+
+    audit_token = set_audit_context({
+        "ip_address": client_ip[:45],
+        "device_name": device_name,
+        "device_location": device_location,
+        "user_agent": user_agent,
+    })
     request_logger.info("request.start request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
     try:
         response = await call_next(request)
     except Exception:
         request_logger.exception("request.failed request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
         raise
+    finally:
+        reset_audit_context(audit_token)
     duration_ms = round((time.perf_counter() - started) * 1000, 2)
     response.headers["X-Request-ID"] = request_id
     request_logger.info("request.complete request_id=%s method=%s path=%s status=%s duration_ms=%s", request_id, request.method, request.url.path, response.status_code, duration_ms)
@@ -486,9 +594,10 @@ def validate_password(password: str):
         raise HTTPException(status_code=400, detail=f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
 
 def audit(db, actor: str, action: str, target_type: str, target_id="", details=""):
+    metadata = get_audit_context()
     db.execute(
-        "INSERT INTO audit_log (actor_username, action, target_type, target_id, details) VALUES (?, ?, ?, ?, ?)",
-        (actor, action, target_type, str(target_id), details),
+        "INSERT INTO audit_log (actor_username, action, target_type, target_id, details, ip_address, device_name, device_location, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (actor, action, target_type, str(target_id), details, metadata.get("ip_address"), metadata.get("device_name"), metadata.get("device_location"), metadata.get("user_agent")),
     )
 
 def create_access_token(data: dict):
@@ -524,7 +633,14 @@ def get_current_user(request: Request):
 
 def require_roles(allowed_roles: list[str]):
     def role_checker(current_user: dict = Depends(get_current_user)):
-        if current_user["role"] not in allowed_roles and current_user["role"] != "Admin":
+        expanded_roles = set(allowed_roles)
+        if "Admin" in expanded_roles:
+            expanded_roles.add("System Administrator")
+        if "Technician" in expanded_roles:
+            expanded_roles.add("Histotechnologist")
+        if "Viewer" in expanded_roles:
+            expanded_roles.update({"Auditor", "Laboratory Manager", "AI Analyst"})
+        if current_user["role"] not in expanded_roles and current_user["role"] not in {"System Administrator", "Super Administrator"}:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
         return current_user
     return role_checker
@@ -535,18 +651,30 @@ class UserCreate(BaseModel):
     password: str
     role: str
 
+USER_ROLES = {
+    "System Administrator", "Laboratory Manager", "Pathologist",
+    "Histotechnologist", "AI Analyst", "Integration Engineer", "Auditor",
+}
+ASSIGNABLE_USER_ROLES = USER_ROLES
+PROTECTED_SUPER_ADMINS = {"etddev", "etdadmin"}
+
+def is_protected_super_admin(username: str) -> bool:
+    return (username or "").casefold() in PROTECTED_SUPER_ADMINS
+
 @app.get("/api/users")
-def get_users(current_user: dict = Depends(require_roles(["Admin"]))):
+def get_users(current_user: dict = Depends(require_roles(["System Administrator"]))):
     with closing(connect()) as db:
         users = db.execute("SELECT id, username, display_name, role, is_active, created_at, last_login FROM users").fetchall()
         return [dict(u) for u in users]
 
 @app.delete("/api/users/{user_id}")
-def delete_user(user_id: int, current_user: dict = Depends(require_roles(["Admin"]))):
+def delete_user(user_id: int, current_user: dict = Depends(require_roles(["System Administrator"]))):
     with closing(connect()) as db:
-        target = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        target = db.execute("SELECT id, username FROM users WHERE id = ?", (user_id,)).fetchone()
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
+        if is_protected_super_admin(target["username"]):
+            raise HTTPException(status_code=403, detail="Protected System Administrator accounts cannot be deleted")
             
         count_row = db.execute("SELECT COUNT(*) as cnt FROM users").fetchone()
         if count_row and count_row["cnt"] <= 1:
@@ -558,9 +686,11 @@ def delete_user(user_id: int, current_user: dict = Depends(require_roles(["Admin
         return {"message": "User deleted successfully"}
 
 @app.post("/api/users")
-def create_user(user: UserCreate, current_user: dict = Depends(require_roles(["Admin"]))):
-    if user.role not in ["Admin", "Pathologist", "Technician", "Viewer"]:
-        raise HTTPException(status_code=400, detail="Invalid role")
+def create_user(user: UserCreate, current_user: dict = Depends(require_roles(["System Administrator"]))):
+    if is_protected_super_admin(user.username):
+        raise HTTPException(status_code=403, detail="Reserved Super Administrator usernames cannot be created through user management")
+    if user.role not in ASSIGNABLE_USER_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid or protected role")
     validate_password(user.password)
     with closing(connect()) as db:
         existing = db.execute("SELECT id FROM users WHERE username = ?", (user.username,)).fetchone()
@@ -581,18 +711,20 @@ def create_user(user: UserCreate, current_user: dict = Depends(require_roles(["A
 
 
 @app.patch("/api/users/{user_id}/role")
-def update_user_role(user_id: int, change: dict, current_user: dict = Depends(require_roles(["Admin"]))):
-    if change.get("role") not in ["Admin", "Pathologist", "Technician", "Viewer"]:
-        raise HTTPException(status_code=400, detail="Invalid role")
+def update_user_role(user_id: int, change: dict, current_user: dict = Depends(require_roles(["System Administrator"]))):
+    if change.get("role") not in ASSIGNABLE_USER_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid or protected role")
     with closing(connect()) as db:
-        target = db.execute("SELECT id, role FROM users WHERE id = ?", (user_id,)).fetchone()
+        target = db.execute("SELECT id, username, role FROM users WHERE id = ?", (user_id,)).fetchone()
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
+        if is_protected_super_admin(target["username"]):
+            raise HTTPException(status_code=403, detail="Protected System Administrator roles cannot be changed")
             
-        if target["role"] == "Admin" and change["role"] != "Admin":
-            count_row = db.execute("SELECT COUNT(*) as cnt FROM users WHERE role = 'Admin'").fetchone()
+        if target["role"] == "System Administrator" and change["role"] != "System Administrator":
+            count_row = db.execute("SELECT COUNT(*) as cnt FROM users WHERE role = 'System Administrator'").fetchone()
             if count_row and count_row["cnt"] <= 1:
-                raise HTTPException(status_code=400, detail="Cannot demote the last Admin")
+                raise HTTPException(status_code=400, detail="Cannot demote the last System Administrator")
                 
         db.execute("UPDATE users SET role = ? WHERE id = ?", (change["role"], user_id))
         audit(db, current_user["username"], "user.role_change", "user", user_id, change["role"])
@@ -600,7 +732,7 @@ def update_user_role(user_id: int, change: dict, current_user: dict = Depends(re
     return {"message": "Role updated"}
 
 @app.patch("/api/users/{user_id}/password")
-def reset_user_password(user_id: int, change: dict, current_user: dict = Depends(require_roles(["Admin"]))):
+def reset_user_password(user_id: int, change: dict, current_user: dict = Depends(require_roles(["System Administrator"]))):
     new_password = change.get("password")
     validate_password(new_password)
     with closing(connect()) as db:
@@ -723,10 +855,22 @@ def serialize_slide(row):
     item["thumbnail_url"] = f"{base}/thumbnail"
     item["dzi_url"] = f"{base}/slide.dzi" if item["file_type"] == "wsi" else None
     # Normalize SQLite integer booleans to Python bools
-    for bool_field in ("qc_missing_tissue", "qc_blur", "qc_scan_artifact", "qc_incorrect_label"):
+    for bool_field in ("qc_missing_tissue", "qc_blur", "qc_scan_artifact", "qc_incorrect_label", "qc_unusual_staining"):
         if bool_field in item and item[bool_field] is not None:
             item[bool_field] = bool(item[bool_field])
     return item
+
+
+@app.get("/api/slides/{slide_id}/validation", dependencies=[Depends(require_roles(["Admin", "Technician", "Pathologist", "Viewer"]))])
+def slide_validation(slide_id: int):
+    get_slide(slide_id)
+    with closing(connect()) as db:
+        version = db.execute("SELECT TOP 1 * FROM image_versions WHERE slide_id=? ORDER BY version DESC", (slide_id,)).fetchone()
+    if version is None:
+        raise HTTPException(404, "No validation record exists for this slide")
+    result = json.loads(version["metadata_json"] or "{}")
+    result["image_version"] = version["version"]
+    return result
 
 
 
@@ -823,6 +967,7 @@ class SlideQcUpdate(BaseModel):
     qc_blur: bool = False
     qc_scan_artifact: bool = False
     qc_incorrect_label: bool = False
+    qc_unusual_staining: bool = False
     qc_note: str = Field(default="", max_length=4000)
 
 class ReviewNoteCreate(BaseModel):
@@ -842,7 +987,7 @@ def _append_history(db, case_pk, change_type, previous, new, actor):
         VALUES (?, ?, ?, ?, ?)""", (case_pk, change_type, previous, new, actor))
 
 
-@app.patch("/api/cases/{case_pk}/reviewer", dependencies=[Depends(require_roles(["Admin", "Pathologist"]))])
+@app.patch("/api/cases/{case_pk}/reviewer", dependencies=[Depends(require_roles(["Admin", "Pathologist", "Laboratory Manager"]))])
 def assign_reviewer(case_pk: int, change: ReviewerChange, current_user: dict = Depends(get_current_user)):
     case = get_case(case_pk)
     actor = current_user["display_name"]
@@ -867,38 +1012,34 @@ def add_slide_qc(slide_pk: int, qc: SlideQcUpdate, current_user: dict = Depends(
     with closing(connect()) as db:
         db.execute('''UPDATE slides SET 
             qc_status = ?, qc_missing_tissue = ?, qc_blur = ?, 
-            qc_scan_artifact = ?, qc_incorrect_label = ?, qc_note = ?, 
+            qc_scan_artifact = ?, qc_incorrect_label = ?, qc_unusual_staining = ?, qc_note = ?, 
             qc_actor = ?, qc_timestamp = ? 
             WHERE id = ?''', 
             (qc.qc_status, qc.qc_missing_tissue, qc.qc_blur, 
-             qc.qc_scan_artifact, qc.qc_incorrect_label, qc.qc_note, 
+             qc.qc_scan_artifact, qc.qc_incorrect_label, qc.qc_unusual_staining, qc.qc_note, 
              actor, now, slide_pk))
         
         db.execute('''INSERT INTO slide_qc_history (
             slide_id, qc_status, qc_missing_tissue, qc_blur, 
-            qc_scan_artifact, qc_incorrect_label, qc_note, actor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            qc_scan_artifact, qc_incorrect_label, qc_unusual_staining, qc_note, actor)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (slide_pk, qc.qc_status, qc.qc_missing_tissue, qc.qc_blur,
-             qc.qc_scan_artifact, qc.qc_incorrect_label, qc.qc_note, actor))
+             qc.qc_scan_artifact, qc.qc_incorrect_label, qc.qc_unusual_staining, qc.qc_note, actor))
         db.commit()
     
     return serialize_slide(get_slide(slide_pk))
 
-@app.patch("/api/cases/{case_pk}/status", dependencies=[Depends(require_roles(["Admin", "Pathologist", "Technician"]))])
+@app.patch("/api/cases/{case_pk}/status", dependencies=[Depends(require_roles(["Admin", "Pathologist", "Technician", "Laboratory Manager"]))])
 def change_case_status(case_pk: int, change: StatusChange, current_user: dict = Depends(get_current_user)):
     case = get_case(case_pk)
     actor = current_user["display_name"]
     new_status = change.status.strip()
-    allowed = {
-        "New": {"In Review"},
-        "In Review": {"Reviewed"},
-        "Reviewed": {"In Review"},
-    }
-    current = case["status"]
-    if new_status not in {"New", "In Review", "Reviewed"}:
+    valid_statuses = {"New", "In Review", "Reviewed"}
+    if new_status not in valid_statuses:
         raise HTTPException(400, "Status must be New, In Review, or Reviewed")
-    if new_status not in allowed.get(current, set()):
-        raise HTTPException(409, f"Unsupported status transition: {current} → {new_status}")
+    current = case["status"]
+    if new_status == current:
+        return serialize_case(case)
     if new_status == "In Review":
         with closing(connect()) as db:
             needs_rescan = db.execute("SELECT COUNT(*) AS count FROM slides WHERE case_id = ? AND qc_status = 'Needs rescan'", (case_pk,)).fetchone()['count']
@@ -975,47 +1116,24 @@ async def _save_stream(upload: UploadFile, path: Path, limit: int):
 
 async def validate_and_store(upload: UploadFile):
     suffix = Path(upload.filename or "").suffix.lower()
-    if suffix == ".svs":
-        if openslide is None:
-            raise HTTPException(503, "WSI upload requires OpenSlide. Install openslide-python and openslide-bin, or configure OPENSLIDE_PATH.")
-        filename = f"{uuid4().hex}.svs"
-        path = _stored_path(filename)
-        file_size = await _save_stream(upload, path, WSI_MAX_BYTES)
-        try:
-            with openslide.OpenSlide(str(path)) as slide:
-                width, height = slide.dimensions
-                image_format = slide.properties.get(openslide.PROPERTY_NAME_VENDOR, "unknown")
-                DeepZoomGenerator(slide, tile_size=TILE_SIZE, overlap=TILE_OVERLAP)
-        except Exception as exc:
-            path.unlink(missing_ok=True)
-            unsupported = getattr(openslide, "OpenSlideUnsupportedFormatError", ())
-            if unsupported and isinstance(exc, unsupported):
-                raise HTTPException(400, "File is not a supported whole-slide image") from exc
-            raise HTTPException(400, f"Could not open whole-slide image: {exc}") from exc
-        return filename, "wsi", image_format, file_size, width, height
-
-    if upload.content_type not in RASTER_TYPES or suffix not in {".jpg", ".jpeg", ".png"}:
+    if suffix not in {".jpg", ".jpeg", ".png", ".svs"}:
         await upload.close()
         raise HTTPException(400, "Upload a JPG, PNG, or Aperio SVS file")
-    data = await upload.read(RASTER_MAX_BYTES + 1)
-    await upload.close()
-    if not data or len(data) > RASTER_MAX_BYTES:
-        raise HTTPException(400, "Image must be nonempty and at most 10 MB")
-    try:
-        with Image.open(BytesIO(data)) as check:
-            check.verify()
-        with Image.open(BytesIO(data)) as check:
-            if check.format not in {"JPEG", "PNG"}:
-                raise ValueError("Invalid image format")
-            width, height = check.size
-            image_format = check.format
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
-        raise HTTPException(400, "File is not a valid JPG or PNG image") from exc
-    extension = ".jpg" if image_format == "JPEG" else ".png"
-    filename = f"{uuid4().hex}{extension}"
+    if suffix == ".svs" and openslide is None:
+        await upload.close()
+        raise HTTPException(503, "WSI upload requires OpenSlide. Install openslide-python and openslide-bin, or configure OPENSLIDE_PATH.")
+    filename = f"{uuid4().hex}{suffix}"
     path = _stored_path(filename)
-    path.write_bytes(data)
-    return filename, "raster", image_format, len(data), width, height
+    try:
+        await _save_stream(upload, path, WSI_MAX_BYTES if suffix == ".svs" else RASTER_MAX_BYTES)
+        validation = validate_image_file(path, openslide)
+    except ImageValidationError as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(400, str(exc)) from exc
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return filename, validation
 
 
 async def add_slide_record(case_pk, image, label, stain="", specimen_description=""):
@@ -1024,15 +1142,25 @@ async def add_slide_record(case_pk, image, label, stain="", specimen_description
     if not label or len(label) > 120:
         raise HTTPException(400, "Slide label must be 1 to 120 characters")
     stored = await validate_and_store(image)
-    filename, file_type, image_format, file_size, width, height = stored
+    filename, validation = stored
     try:
         with closing(connect()) as db:
+            duplicate = db.execute("SELECT TOP 1 stored_filename FROM image_versions WHERE checksum_sha256=?", (validation["checksum_sha256"],)).fetchone()
+            if duplicate:
+                raise HTTPException(409, "Duplicate image content already exists")
             cursor = db.execute("""INSERT INTO slides
                 (case_id, label, stain, specimen_description, filename, file_type,
-                 format, file_size, width, height, upload_state)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready')""",
+                 format, file_size, width, height, level_count, upload_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready')""",
                 (case_pk, label, stain.strip(), specimen_description.strip(), filename,
-                 file_type, image_format, file_size, width, height))
+                 validation["file_type"], validation["format"], validation["file_size"],
+                 validation["width"], validation["height"], validation["level_count"]))
+            calibration = validation["physical_calibration"]
+            pixel_size = calibration["pixel_size_microns_x"] if calibration["available"] else None
+            db.execute("""INSERT INTO image_versions
+                (slide_id,version,checksum_sha256,pixel_size_microns,metadata_json,stored_filename)
+                VALUES (?,1,?,?,?,?)""",
+                (cursor.lastrowid, validation["checksum_sha256"], pixel_size, json.dumps(validation), filename))
             db.commit()
             row = db.execute("SELECT * FROM slides WHERE id = ?", (cursor.lastrowid,)).fetchone()
     except Exception:
@@ -1093,6 +1221,28 @@ async def add_slide(
     return serialize_slide(await add_slide_record(case_pk, image, label, stain, specimen_description))
 
 
+@app.post("/api/slides/{slide_id}/versions", status_code=201, dependencies=[Depends(require_roles(["Admin", "Technician"]))])
+async def reimport_slide_version(slide_id: int, image: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    get_slide(slide_id)
+    filename, validation = await validate_and_store(image)
+    try:
+        with closing(connect()) as db:
+            previous = db.execute("SELECT TOP 1 version,checksum_sha256 FROM image_versions WHERE slide_id=? ORDER BY version DESC", (slide_id,)).fetchone()
+            next_version = (previous["version"] if previous else 0) + 1
+            validation["duplicate_of_previous_version"] = bool(previous and previous["checksum_sha256"] == validation["checksum_sha256"])
+            calibration = validation["physical_calibration"]
+            cursor = db.execute("""INSERT INTO image_versions
+                (slide_id,version,checksum_sha256,source_device,pixel_size_microns,metadata_json,stored_filename)
+                VALUES (?,?,?,?,?,?,?)""", (slide_id,next_version,validation["checksum_sha256"],"manual-reimport",
+                calibration["pixel_size_microns_x"] if calibration["available"] else None,json.dumps(validation),filename))
+            audit(db,current_user["username"],"image.version_import","slide",slide_id,f"version={next_version}; image_version_id={cursor.lastrowid}")
+            db.commit()
+        return {"id":cursor.lastrowid,"slide_id":slide_id,"version":next_version,"stored_filename":filename,"validation":validation}
+    except Exception:
+        _stored_path(filename).unlink(missing_ok=True)
+        raise
+
+
 class SlideUpdate(BaseModel):
     label: str = Field(min_length=1, max_length=120)
     stain: str = Field(default="", max_length=120)
@@ -1100,7 +1250,7 @@ class SlideUpdate(BaseModel):
 
 
 class AnnotationCreate(BaseModel):
-    annotation_type: str = Field(default="rectangle", pattern="^(rectangle|polygon|arrow)$")
+    annotation_type: str = Field(default="rectangle", pattern="^(point|line|polygon|rectangle|ellipse|freehand|arrow)$")
     label: str = Field(min_length=1, max_length=120)
     note: str = Field(default="", max_length=2000)
     color: str = Field(default="#e85d75", pattern=r"^#[0-9a-fA-F]{6}$")
@@ -1109,6 +1259,8 @@ class AnnotationCreate(BaseModel):
     width: float | None = None
     height: float | None = None
     points: list[list[float]] | None = None
+    category: str = Field(default="Pathologist", max_length=120)
+    annotation_status: str = Field(default="Active", pattern="^(Active|Resolved|Excluded|Corrected)$")
 
 
 class AnnotationUpdate(BaseModel):
@@ -1230,13 +1382,21 @@ def update_annotation(slide_id: int, annotation_id: int, update: AnnotationUpdat
 
 
 @app.delete("/api/slides/{slide_id}/annotations/{annotation_id}", status_code=204, dependencies=[Depends(require_roles(["Admin", "Pathologist"]))])
-def delete_annotation(slide_id: int, annotation_id: int):
-    _annotation_for_slide(slide_id, annotation_id)
+def delete_annotation(slide_id: int, annotation_id: int, current_user: dict = Depends(get_current_user)):
+    annotation = _annotation_for_slide(slide_id, annotation_id)
     with closing(connect()) as db:
-        db.execute(
+        db.execute("DELETE FROM annotation_revisions WHERE annotation_id = ?", (annotation_id,))
+        result = db.execute(
             "DELETE FROM annotations WHERE id = ? AND slide_id = ?",
             (annotation_id, slide_id),
         )
+        if result.cursor.rowcount != 1:
+            raise HTTPException(409, "Annotation changed before it could be deleted")
+        audit(db, current_user["username"], "annotation.delete", "annotation", annotation_id, json.dumps({
+            "slide_id": slide_id,
+            "label": annotation["label"],
+            "annotation_type": annotation["annotation_type"],
+        }))
         db.commit()
     return Response(status_code=204)
 
@@ -1289,25 +1449,32 @@ def slide_descriptor(slide_id: int):
 
 @app.get("/api/slides/{slide_id}/slide_files/{level}/{column}_{row}.jpeg", dependencies=[Depends(require_roles(["Admin", "Technician", "Pathologist", "Viewer"]))])
 def slide_tile(slide_id: int, level: int, column: int, row: int):
-    _, path = require_wsi_slide(slide_id)
     if min(level, column, row) < 0:
         raise HTTPException(404, "Tile not found")
+
+    cached_tile = get_cached_tile(slide_id, level, column, row)
+    if cached_tile is not None:
+        return Response(cached_tile, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+
+    _, path = get_cached_wsi_slide(slide_id)
     try:
-        with slide_cache.acquire(path) as slide:
-            deep_zoom = DeepZoomGenerator(slide, tile_size=TILE_SIZE, overlap=TILE_OVERLAP)
+        with slide_cache.acquire_generator(path) as deep_zoom:
             if level >= deep_zoom.level_count:
                 raise HTTPException(404, "Tile not found")
             tiles_x, tiles_y = deep_zoom.level_tiles[level]
             if column >= tiles_x or row >= tiles_y:
                 raise HTTPException(404, "Tile not found")
             tile = deep_zoom.get_tile(level, (column, row)).convert("RGB")
-            output = BytesIO()
-            tile.save(output, "JPEG", quality=85)
+
+        output = BytesIO()
+        tile.save(output, "JPEG", quality=85)
+        jpeg_data = output.getvalue()
+        set_cached_tile(slide_id, level, column, row, jpeg_data)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(500, f"Could not render slide tile: {exc}") from exc
-    return Response(output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+    return Response(jpeg_data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
 # Legacy case-level viewer URLs resolve to the first slide after migration.
@@ -1562,4 +1729,4 @@ def export_report_html(report_id: int):
 
 from platform_api import create_platform_router, init_platform_schema
 init_platform_schema(connect)
-app.include_router(create_platform_router(connect, require_roles, get_current_user, UPLOADS))
+app.include_router(create_platform_router(connect, require_roles, get_current_user, UPLOADS, openslide))

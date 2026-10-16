@@ -1,30 +1,48 @@
+"""Provision the only two protected local Super Administrator accounts."""
+
 import getpass
-from main import connect, get_password_hash, validate_password
+import os
 from contextlib import closing
 
-def create_super_admin():
-    username = "etd-dev"
-    password = getpass.getpass("Password: ")
-    validate_password(password)
-    role = "Admin"
-    display_name = "ETD-Admin"
+from main import connect, get_password_hash
+
+
+PROTECTED_ADMIN_USERS = (
+    ("ETDDev", "ETD Developer"),
+    ("ETDadmin", "EID Administrator"),
+)
+
+
+def create_super_admins():
+    password = os.getenv("PROTECTED_ADMIN_PASSWORD") or getpass.getpass("Password for both protected administrators: ")
+    if not password:
+        raise SystemExit("Password is required.")
+    password_hash = get_password_hash(password)
 
     with closing(connect()) as db:
-        existing = db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
-        if existing:
-            print(f"User {username} already exists.")
-            return
-
-        hashed = get_password_hash(password)
         try:
-            db.execute(
-                "INSERT INTO users (username, display_name, role, password_hash) VALUES (?, ?, ?, ?)",
-                (username, display_name, role, hashed)
-            )
+            for username, display_name in PROTECTED_ADMIN_USERS:
+                existing = db.execute(
+                    "SELECT id FROM users WHERE LOWER(username) = LOWER(?)",
+                    (username,),
+                ).fetchone()
+                if existing:
+                    db.execute(
+                        "UPDATE users SET username=?, display_name=?, role='Super Administrator', password_hash=?, is_active=1 WHERE id=?",
+                        (username, display_name, password_hash, existing["id"]),
+                    )
+                else:
+                    db.execute(
+                        "INSERT INTO users (username, display_name, role, password_hash) VALUES (?, ?, 'Super Administrator', ?)",
+                        (username, display_name, password_hash),
+                    )
             db.commit()
-            print(f"Successfully created super admin: {username}")
-        except Exception as e:
-            print(f"Failed to create super admin: {e}")
+        except Exception:
+            db.rollback()
+            raise SystemExit("Failed to provision protected System Administrator accounts.")
+
+    print("The two protected Super Administrator accounts were provisioned successfully.")
+
 
 if __name__ == "__main__":
-    create_super_admin()
+    create_super_admins()
